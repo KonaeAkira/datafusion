@@ -54,6 +54,12 @@ pub struct ScalarFunctionExpr {
     name: String,
     args: Vec<Arc<dyn PhysicalExpr>>,
     return_field: FieldRef,
+    /// The fields of [`Self::args`], derived once from the plan schema.
+    ///
+    /// `None` means they are unknown and have to be re-derived from the schema
+    /// of each incoming batch, which is what [`Self::new`] leaves behind since
+    /// it is not given a schema. Use [`Self::with_arg_fields`] to supply them.
+    arg_fields: Option<Vec<FieldRef>>,
     config_options: Arc<ConfigOptions>,
 }
 
@@ -82,6 +88,7 @@ impl ScalarFunctionExpr {
             name: name.to_owned(),
             args,
             return_field,
+            arg_fields: None,
             config_options,
         }
     }
@@ -116,8 +123,21 @@ impl ScalarFunctionExpr {
             name,
             args,
             return_field,
+            arg_fields: Some(arg_fields),
             config_options,
         })
+    }
+
+    /// Supply the fields of the arguments, as derived from the plan schema.
+    ///
+    /// [`Self::try_new`] does this automatically. Callers of [`Self::new`] that
+    /// have the input schema at hand can use this to avoid re-deriving the
+    /// argument fields for every batch in [`PhysicalExpr::evaluate`], which for
+    /// arguments that do not override [`PhysicalExpr::return_field`] means a
+    /// `Display` render and two recursive walks of each argument per batch.
+    pub fn with_arg_fields(mut self, arg_fields: Vec<FieldRef>) -> Self {
+        self.arg_fields = Some(arg_fields);
+        self
     }
 
     /// Get the scalar function implementation
@@ -190,6 +210,9 @@ impl PartialEq for ScalarFunctionExpr {
             name,
             args,
             return_field,
+            // Derived from the plan schema, so it does not take part in
+            // equality: it would make expression equality schema-sensitive.
+            arg_fields: _,
             config_options,
         } = self;
         fun.eq(&o.fun)
@@ -209,6 +232,7 @@ impl Hash for ScalarFunctionExpr {
             name,
             args,
             return_field,
+            arg_fields: _,     // derived, and excluded from `PartialEq`
             config_options: _, // expensive to hash, and often equal
         } = self;
         fun.hash(state);
@@ -240,11 +264,16 @@ impl PhysicalExpr for ScalarFunctionExpr {
             .map(|e| e.evaluate(batch))
             .collect::<Result<Vec<_>>>()?;
 
-        let arg_fields = self
-            .args
-            .iter()
-            .map(|e| e.return_field(batch.schema_ref()))
-            .collect::<Result<Vec<_>>>()?;
+        let arg_fields = match &self.arg_fields {
+            Some(arg_fields) => arg_fields.clone(),
+            // No plan schema was available at construction time, so fall back to
+            // deriving the fields from the batch schema.
+            None => self
+                .args
+                .iter()
+                .map(|e| e.return_field(batch.schema_ref()))
+                .collect::<Result<Vec<_>>>()?,
+        };
 
         let input_empty = args.is_empty();
         let input_all_scalar = args
@@ -292,6 +321,9 @@ impl PhysicalExpr for ScalarFunctionExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
+        // The cached `arg_fields` describe the old children, and there is no
+        // schema here to re-derive them from, so `new` leaves them unset and
+        // `evaluate` falls back to deriving them per batch.
         Ok(Arc::new(ScalarFunctionExpr::new(
             &self.name,
             Arc::clone(&self.fun),
@@ -426,5 +458,127 @@ mod tests {
         assert!(!stable_expr.is_volatile_node());
         let stable_arc: Arc<dyn PhysicalExpr> = Arc::new(stable_expr);
         assert!(!is_volatile(&stable_arc));
+    }
+
+    /// A UDF that reports the argument field it was handed, so that a test can
+    /// tell whether it came from the plan schema or from the batch schema.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct EchoArgFieldUDF {
+        signature: Signature,
+    }
+
+    impl EchoArgFieldUDF {
+        fn new() -> Self {
+            Self {
+                signature: Signature::uniform(
+                    1,
+                    vec![DataType::Int32],
+                    Volatility::Immutable,
+                ),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for EchoArgFieldUDF {
+        fn name(&self) -> &str {
+            "echo_arg_field"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Utf8)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            let field = &args.arg_fields[0];
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(format!(
+                "{}:{}",
+                field.name(),
+                field.is_nullable()
+            )))))
+        }
+    }
+
+    fn echo_arg_field(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> String {
+        match expr.evaluate(batch).unwrap() {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s,
+            other => panic!("unexpected output {other:?}"),
+        }
+    }
+
+    /// The argument fields are taken from the plan schema when it was available
+    /// at construction time, and re-derived from the batch otherwise.
+    ///
+    /// The two can disagree -- a reader may hand back a nullable array where the
+    /// plan said non-nullable -- so this pins down which one each constructor
+    /// uses.
+    #[test]
+    fn test_arg_fields_source() {
+        let udf = Arc::new(ScalarUDF::from(EchoArgFieldUDF::new()));
+        let config_options = Arc::new(ConfigOptions::new());
+        let args = vec![Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>];
+
+        // The plan says `a` is not nullable ...
+        let plan_schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        // ... but the batch that shows up at runtime says it is.
+        let batch_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            batch_schema,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![Some(1)]))],
+        )
+        .unwrap();
+
+        // `try_new` caches the fields derived from the plan schema.
+        let from_plan: Arc<dyn PhysicalExpr> = Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::clone(&udf),
+                args.clone(),
+                &plan_schema,
+                Arc::clone(&config_options),
+            )
+            .unwrap(),
+        );
+        assert_eq!(echo_arg_field(&from_plan, &batch), "a:false");
+
+        // `new` has no schema, so the fields come from the batch.
+        let from_batch: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "echo_arg_field",
+            Arc::clone(&udf),
+            args.clone(),
+            Field::new("echo_arg_field", DataType::Utf8, true).into(),
+            Arc::clone(&config_options),
+        ));
+        assert_eq!(echo_arg_field(&from_batch, &batch), "a:true");
+
+        // ... unless the caller opts in with the fields it derived itself.
+        let opted_in: Arc<dyn PhysicalExpr> = Arc::new(
+            ScalarFunctionExpr::new(
+                "echo_arg_field",
+                Arc::clone(&udf),
+                args.clone(),
+                Field::new("echo_arg_field", DataType::Utf8, true).into(),
+                Arc::clone(&config_options),
+            )
+            .with_arg_fields(vec![Field::new("a", DataType::Int32, false).into()]),
+        );
+        assert_eq!(echo_arg_field(&opted_in, &batch), "a:false");
+
+        // Swapping children invalidates the cache: the new children are not
+        // described by the old fields, and there is no schema to re-derive from.
+        let rechilded = Arc::clone(&from_plan).with_new_children(args).unwrap();
+        assert_eq!(echo_arg_field(&rechilded, &batch), "a:true");
+
+        // Equality and hashing ignore the cached fields.
+        assert_eq!(&from_plan, &from_batch);
+        let hash_of = |expr: &Arc<dyn PhysicalExpr>| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            expr.dyn_hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash_of(&from_plan), hash_of(&from_batch));
     }
 }
